@@ -29,3 +29,6 @@ stats$/
 # Local test data (generated, not tracked)
 tests/test-random/data/
 tests/test-estimator/data/
+
+# Example outputs (generated, not tracked)
+example/random/data_*/
