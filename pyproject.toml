@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qmeas"
+version = "0.1.0"
+description = "Quantum measurement toolkit: randomized measurements / classical shadows on Qiskit Aer and quarkstudio"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "qiskit>=1.0",
+    "qiskit-aer",
+    "quarkstudio",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qmeas"]

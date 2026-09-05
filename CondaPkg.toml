@@ -1,0 +1,14 @@
+[deps]
+numpy = ""
+qiskit = ""
+
+[deps.qiskit-aer]
+channel = "conda-forge"
+
+[pip.deps]
+qiskit-aer = ""
+quarkstudio = ""
+
+[pip.deps.qmeas]
+editable = true
+version = "@ ."
