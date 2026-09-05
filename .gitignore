@@ -24,3 +24,8 @@ stats$/
 # Env
 .venv/
 .env
+.envrc
+
+# Local test data (generated, not tracked)
+tests/test-random/data/
+tests/test-estimator/data/
