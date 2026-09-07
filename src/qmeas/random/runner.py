@@ -1,5 +1,4 @@
 import asyncio
-import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -7,11 +6,11 @@ from qiskit import QuantumCircuit, qasm2, transpile
 from qiskit.circuit import CircuitInstruction, Clbit
 from qiskit.circuit.library import RZGate
 from qiskit_aer import AerSimulator
-from quark import Task
 
 from .config import AerOptions, QuarkOptions, RandomMeasConfig
 from .ensemble import conjugate_binds, create_parameter_generator
 from .io import save_npz, write_summary
+from .quark_client import await_quark, make_quark_task, quark_token, submit_quark
 
 Counts = dict[str, int]
 
@@ -64,6 +63,15 @@ async def run_random(config: RandomMeasConfig) -> dict:
 
     # 真并发: 先把全部 SettingRun（含 exp1/exp2）建成协程, 一次 gather 发出去,
     # 循环体内不 await, 避免串行等待。
+    # Quark 路径全 run 共享同一对信号量与同一个 Task：只限速度（提交/轮询 QPS）、
+    # 不限总数；同时把每次线程新建 Task 的 /task/verify 洪峰降为 O(1)。
+    submit_sem = poll_sem = tmgr = None
+    if isinstance(config.runner_opts, QuarkOptions):
+        submit_sem = asyncio.Semaphore(config.runner_opts.max_submit_concurrency)
+        poll_sem = asyncio.Semaphore(config.runner_opts.max_poll_concurrency)
+        tmgr = make_quark_task(
+            quark_token(config.runner_opts), config.runner_opts.submit_retries
+        )
     jobs = []
     for run_idx, setting_run in enumerate(config.setting_runs):
         jobs.append(
@@ -74,6 +82,9 @@ async def run_random(config: RandomMeasConfig) -> dict:
                 setting_run,
                 name=f"{config.name}_setting{run_idx}",
                 trivial_qc=trivial_qc_1,
+                _submit_sem=submit_sem,
+                _poll_sem=poll_sem,
+                _tmgr=tmgr,
             )
         )
         if pair is not None:
@@ -85,6 +96,9 @@ async def run_random(config: RandomMeasConfig) -> dict:
                     setting_run,
                     name=f"{config.name}_exp2_setting{run_idx}",
                     trivial_qc=trivial_qc_2,
+                    _submit_sem=submit_sem,
+                    _poll_sem=poll_sem,
+                    _tmgr=tmgr,
                 )
             )
     all_results = await asyncio.gather(*jobs)
@@ -138,14 +152,20 @@ async def run_random(config: RandomMeasConfig) -> dict:
     return write_summary(config, npz_paths, pair_info=pair_info)
 
 
-async def _run_one(opts, qc, binds, setting_run, *, name, trivial_qc):
+async def _run_one(
+    opts, qc, binds, setting_run, *, name, trivial_qc,
+    _submit_sem=None, _poll_sem=None, _tmgr=None,
+):
     # 唯一 await 分发: Aer 是纯阻塞同步计算, 丢进线程池不占事件循环;
     # Quark 自身是真异步协程, 直接 await。
     if isinstance(opts, AerOptions):
         return await asyncio.to_thread(
             _run_aer, opts, qc, binds, setting_run, name=name, trivial_qc=trivial_qc
         )
-    return await _run_quark(opts, qc, binds, setting_run, name=name, trivial_qc=trivial_qc)
+    return await _run_quark(
+        opts, qc, binds, setting_run, name=name, trivial_qc=trivial_qc,
+        _submit_sem=_submit_sem, _poll_sem=_poll_sem, _tmgr=_tmgr,
+    )
 
 
 # ── Aer ────────────────────────────────────────────────────────────
@@ -177,10 +197,13 @@ def _run_aer(opts, qc, binds, setting_run, *, name, trivial_qc):
     return RunResult(counts=counts, trivial_counts=trivial_counts)
 
 
-# ── Quark ──────────────────────────────────────────────────────────
+# ── Quark 编排（HTTP 细节见 quark_client） ─────────────────────────
 
 
-async def _run_quark(opts, qc, binds, setting_run, *, name, trivial_qc):
+async def _run_quark(
+    opts, qc, binds, setting_run, *, name, trivial_qc,
+    _submit_sem=None, _poll_sem=None, _tmgr=None,
+):
     # transpile 是 CPU 阻塞工作, 丢进线程池; 主/标定两个批量一次 gather。
     if trivial_qc is not None:
         qasm_ls, trivial_qasm_ls = await asyncio.gather(
@@ -195,36 +218,46 @@ async def _run_quark(opts, qc, binds, setting_run, *, name, trivial_qc):
         )
         trivial_qasm_ls = None
 
-    token = opts.token or os.environ["QUARK_TOKEN"]
-    # 提交是阻塞 HTTP, 每个提交独立线程 + 独立 Task, 顺序与轮询对应
-    # (主, 标定交错), 一次 gather 全部发出去, 循环体内不 await。
-    submit_coros = []
-    for i, qasm_str in enumerate(qasm_ls):
-        submit_coros.append(
-            asyncio.to_thread(
-                _submit_quark,
-                token,
-                opts,
-                qasm_str,
-                setting_run.num_shots,
-                f"{name}_U{i}",
+    # 未经 run_random 分发的直接调用：本地建默认限流与共享 Task，保证行为一致。
+    if _submit_sem is None:
+        _submit_sem = asyncio.Semaphore(opts.max_submit_concurrency)
+    if _poll_sem is None:
+        _poll_sem = asyncio.Semaphore(opts.max_poll_concurrency)
+    if _tmgr is None:
+        _tmgr = make_quark_task(quark_token(opts), opts.submit_retries)
+
+    # 提交是阻塞 HTTP，限流后一次 gather 发出去，循环体内不 await。
+    # (主， 标定交错)，顺序与轮询对应。
+    async def _submit_one(qasm_str, shots, task_name):
+        async with _submit_sem:
+            return await asyncio.to_thread(
+                submit_quark, _tmgr, opts, qasm_str, shots, task_name
             )
-        )
+
+    submit_coros = []
+    specs = []  # 与 tids 一一对应：(qasm_str, shots, task_name)，供 error 重提用
+    for i, qasm_str in enumerate(qasm_ls):
+        submit_coros.append(_submit_one(qasm_str, setting_run.num_shots, f"{name}_U{i}"))
+        specs.append((qasm_str, setting_run.num_shots, f"{name}_U{i}"))
         if trivial_qasm_ls is not None:
             submit_coros.append(
-                asyncio.to_thread(
-                    _submit_quark,
-                    token,
-                    opts,
-                    trivial_qasm_ls[i],
-                    setting_run.num_shots,
-                    f"{name}_calib_U{i}",
+                _submit_one(
+                    trivial_qasm_ls[i], setting_run.num_shots, f"{name}_calib_U{i}"
                 )
             )
+            specs.append((trivial_qasm_ls[i], setting_run.num_shots, f"{name}_calib_U{i}"))
     tids = list(await asyncio.gather(*submit_coros))
 
     # 轮询已是并发: 建 task 不 await, 一次 gather 等全部。
-    awaiters = [asyncio.create_task(_await_quark(token, tid)) for tid in tids]
+    async def _poll_one(tid, spec):
+        async with _poll_sem:
+            return await await_quark(
+                _tmgr, tid, opts, _submit_sem, *spec, attempt_tag=name
+            )
+
+    awaiters = [
+        asyncio.create_task(_poll_one(tid, spec)) for tid, spec in zip(tids, specs)
+    ]
     try:
         counts = await asyncio.gather(*awaiters)
     except Exception:
@@ -235,44 +268,6 @@ async def _run_quark(opts, qc, binds, setting_run, *, name, trivial_qc):
     if trivial_qasm_ls is None:
         return RunResult(counts=counts)
     return RunResult(counts=counts[0::2], trivial_counts=counts[1::2])
-
-
-def _submit_quark(token, opts, qasm_str, shots, name):
-    """同步阻塞提交, 调用方负责 to_thread; 每次新建 Task, 线程间不共享。"""
-    tmgr = Task(token)
-    task = {
-        "chip": opts.chip,
-        "shots": shots,
-        "name": name,
-        "circuit": qasm_str,
-        "options": {
-            "compiler": "qiskit",
-            "correct": opts.correct,
-            "target_qubits": opts.target_qubits,
-        },
-    }
-    return tmgr.run(task)
-
-
-def _fetch_quark_result(token, tid):
-    """同步阻塞取结果, 调用方负责 to_thread; 每次新建 Task, 线程间不共享。"""
-    return Task(token).result(tid)
-
-
-async def _await_quark(token, tid):
-    """轮询任务结果, 返回计数字典。
-
-    排队/运行中平台返回非空 dict 但缺 "count" 键 (error 为空);
-    若 "error" 有实际内容表示平台失败, 打印后继续轮询,
-    直到拿到含 "count" 的结果。
-    """
-    res = {}
-    while "count" not in res:
-        await asyncio.sleep(10)
-        res = await asyncio.to_thread(_fetch_quark_result, token, tid)
-        if res.get("error"):
-            print(f"quark 任务 {tid}: {res['error']}")
-    return res["count"]
 
 
 # ── Circuit & params ───────────────────────────────────────────────

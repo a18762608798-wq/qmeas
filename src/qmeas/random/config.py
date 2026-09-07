@@ -54,6 +54,22 @@ class QuarkOptions:
     optimization_level: int = 3
     basis_gates: list[str] = field(default_factory=lambda: ["rz", "rx", "ry", "cz"])
     correct: bool = False
+    # ── 大批量限流/重试/轮询参数 ──
+    # quark 的 Task 是单例且每次构造都打 /task/verify，无节流的大并发会触发
+    # 服务端限流（空响应 → JSONDecodeError）或过载误报（如 Transpiler 错误）。
+    # run_random 内全 SettingRun 共享同一对信号量与同一个 Task，只限速度、不限总数。
+    max_submit_concurrency: int = 10
+    max_poll_concurrency: int = 20
+    poll_interval: float = 10.0
+    # 单个电路从首次提交到拿结果的最长等待（秒）；超时抛 TimeoutError。
+    # None 表示无限等（大批量不推荐）。
+    poll_timeout: float | None = 24 * 3600.0
+    # 提交/轮询遇到传输层失败（非 JSON、空响应、连接错）的重试次数（指数退避）。
+    submit_retries: int = 6
+    poll_retries: int = 8
+    # 轮询到平台 error（如过载误报的 Transpiler 错误）时，用原 QASM 重提新 tid
+    # 的次数（旧 tid 尽力 cancel/delete）；耗尽后抛错中断（C 策略：fail-fast + 重提）。
+    max_resubmits: int = 3
 
 
 @dataclass
@@ -116,6 +132,4 @@ class RandomMeasConfig:
                 not isinstance(g, int) or not 0 <= g < len(self.meas_indices)
                 for g in i1
             ):
-                raise ValueError(
-                    f"conjugate_pair 的 i1_groups 下标越界: {i1!r}"
-                )
+                raise ValueError(f"conjugate_pair 的 i1_groups 下标越界: {i1!r}")
