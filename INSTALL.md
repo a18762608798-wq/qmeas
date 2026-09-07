@@ -4,17 +4,17 @@
 
 ## Python venv
 
-修改 `python3` 成具体 python 解释器路径.
+修改 `python` 成具体 python 解释器路径.
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
 ```
 
 ### 安装
 
 ```bash
-python3 -m pip install --upgrade --force-reinstall "git+https://github.com/a18762608798-wq/qmeas.git@master"
+python -m pip install --upgrade --force-reinstall "git+https://github.com/a18762608798-wq/qmeas.git@master"
 ```
 
 ### 更新
@@ -22,7 +22,7 @@ python3 -m pip install --upgrade --force-reinstall "git+https://github.com/a1876
 直接重跑安装命令即可（`--force-reinstall` 不能省，否则版本号不变时 pip 会判定已满足而跳过）：
 
 ```bash
-pip install --upgrade --force-reinstall "git+https://github.com/a18762608798-wq/qmeas.git@master"
+python -m pip install --upgrade --force-reinstall "git+https://github.com/a18762608798-wq/qmeas.git@master"
 ```
 
 ## Julia（通过 CondaPkg.jl）
