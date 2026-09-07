@@ -306,12 +306,16 @@ def _to_qasm2(qc, num_settings, binds, opts):
 
 
 def _guard_empty_qubits(qc):
-    """Quark 平台缺陷 workaround: 防止"裸测量比特"。
+    """Quark 平台缺陷 workaround: 补齐空比特。
 
-    quark 对"上面没有任何门、只有测量指令"的比特会直接报错。而 transpile
-    在高优化级别下会把恒等门优化删除, 例如 Z 基 (θ=φ=0) 的 u(0, 0, 0)。
-    这里扫描 transpile 后的电路, 给这类比特在测量前原地插入一个 rz(0):
-    允许的基底门、严格物理恒等, 不改变任何测量统计。
+    两类空比特平台都会报错：
+    1. “裸测量比特”：有测量、没门（transpile 高优化会删掉恒等门，
+       如 Z 基 (θ=φ=0) 的 u(0, 0, 0)）→ 在测量前原地插入 rz(0)；
+    2. “纯空比特”：没门、连测量都没有（如 XXZ pidx=-1 开链的首尾比特，
+       测量只覆盖子集时留下）→ 平台按实际使用比特数匹配 target_qubit，
+       少了就报 Target qubits number mismatch → 文末追加 rz(0)。
+    rz(0) 是允许的基底门、严格物理恒等，不改变任何测量统计；
+    置于 transpile 之后插入，避免被优化掉。
     """
     gated = set()
     for inst in qc.data:
@@ -332,6 +336,11 @@ def _guard_empty_qubits(qc):
                     guarded.add(i)
                     pos += 1
         pos += 1
+    touched = gated | guarded
+    for i in range(qc.num_qubits):
+        if i not in touched:
+            qc.data.append(CircuitInstruction(RZGate(0.0), (qc.qubits[i],), ()))
+            touched.add(i)
     return qc
 
 

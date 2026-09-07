@@ -23,6 +23,7 @@ from quark import Task
 __all__ = [
     "TRANSIENT_HTTP_ERRORS",
     "RETRYABLE_SUBMIT_KEYWORDS",
+    "DETERMINISTIC_ERROR_KEYWORDS",
     "quark_token",
     "make_quark_task",
     "backoff",
@@ -44,6 +45,10 @@ RETRYABLE_SUBMIT_KEYWORDS = (
     "limit", "frequent", "busy", "timeout", "retry", "overload", "queue",
     "429", "502", "503", "504", "empty", "verify",
 )
+
+# 平台 error 含这些关键字时视为确定性错误（如比特映射错配），重提必败，
+# 直接抛错，不消耗 max_resubmits（省配额）。
+DETERMINISTIC_ERROR_KEYWORDS = ("mismatch",)
 
 
 def quark_token(opts) -> str:
@@ -133,6 +138,8 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
     - 平台 "error" 非空（含过载误报的 Transpiler 错误）：旧 tid 尽力
       cancel/delete，用原 qasm_str 重提新 tid 再轮询，最多 max_resubmits 次；
       耗尽后抛 RuntimeError 中断整组（C 策略 fail-fast 部分）。
+      含 DETERMINISTIC_ERROR_KEYWORDS（如 mismatch）的确定性错误不重提，
+      直接抛错（重提必败，省配额）。
     """
     start = time.monotonic()
     tried_tids = [tid]
@@ -168,6 +175,12 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
             return res["count"]
         err = res.get("error")
         if err:
+            if any(k in str(err).lower() for k in DETERMINISTIC_ERROR_KEYWORDS):
+                raise RuntimeError(
+                    f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
+                    f"此类错误是确定性的（如电路比特数与 target_qubits 不匹配），"
+                    f"重提必败，故不重提直接中断；请检查电路/映射后补跑该组。"
+                )
             if resubmits >= opts.max_resubmits:
                 raise RuntimeError(
                     f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
