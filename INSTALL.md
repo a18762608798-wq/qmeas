@@ -19,7 +19,8 @@ python -m pip install --upgrade --force-reinstall "git+https://github.com/a18762
 
 ### 更新
 
-直接重跑安装命令即可（`--force-reinstall` 不能省，否则版本号不变时 pip 会判定已满足而跳过）：
+直接重跑安装命令即可（`--force-reinstall` 不能省，否则版本号不变时 pip 会判定已
+满足而跳过）：
 
 ```bash
 python -m pip install --upgrade --force-reinstall "git+https://github.com/a18762608798-wq/qmeas.git@master"
