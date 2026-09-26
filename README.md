@@ -8,6 +8,10 @@
   程云）上运行。
 - `qmeas.estimator` — 旋转测量基估计器。Aer 路径直接调官方 `EstimatorV2`；Quark
   路径做逐比特对易分组，加旋转门后分别提交任务，从直方图恢复 Pauli 期望值。
+- `qmeas.benchmark` — 真机比特链质量基准与选机选比特推荐。对 Baihua /
+  Shenglian 的候选 8 链跑线性 cluster 态稳定子测量（理论值全 +1）与
+  all-0/all-1 读出校验，按 `0.8 * mean(<S_i>) + 0.2 * readout_fid` 排序，
+  `recommend()` 返回的 `target_qubits` 可直接喂给 `QuarkOptions`。
 
 ## 安装
 

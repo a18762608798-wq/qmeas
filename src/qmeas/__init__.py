@@ -1,5 +1,5 @@
-from . import estimator, models, random
+from . import benchmark, estimator, models, random
 
 __version__ = "0.1.0"
 
-__all__ = ["estimator", "models", "random"]
+__all__ = ["benchmark", "estimator", "models", "random"]
