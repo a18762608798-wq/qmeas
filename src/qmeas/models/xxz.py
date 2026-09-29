@@ -1,4 +1,5 @@
 from qiskit import QuantumCircuit
+from qiskit.quantum_info import SparsePauliOp
 
 
 def get_initial_state(qubit_num, pidx=1, boundary=False):
@@ -33,7 +34,7 @@ def get_initial_state(qubit_num, pidx=1, boundary=False):
         qc.x([2 * i + 1 for i in range(qubit_num // 2)])
     # s = 1, δ = 0
     elif pidx == -1:
-        x_targets = range(0, qubit_num) if boundary else range(1, qubit_num - 1)
+        x_targets = range(qubit_num) if boundary else range(1, qubit_num - 1)
         for i in x_targets:
             qc.x(i)
         for i in range(1, qubit_num - 1, 2):
@@ -46,3 +47,46 @@ def get_initial_state(qubit_num, pidx=1, boundary=False):
     else:
         raise ValueError("The value of pidx must be 1, -1, 0.")
     return qc
+
+
+def get_hamiltonian(qubit_num, s, delta):
+    """构造 SSH-XXZ 链 OBC 哈密顿量, 返回 SparsePauliOp。
+
+    格点编号 m = 1..L 对应 qubit 下标 m-1 (L = qubit_num, 要求偶数)。
+
+    H(s, δ) = H_o + H_e,
+    H_o = (1-s) Σ_{j=1}^{L/2} (X_{2j-1} X_{2j} + Y_{2j-1} Y_{2j} + δ Z_{2j-1} Z_{2j}),
+    H_e = s Σ_{j=1}^{L/2-1} (X_{2j} X_{2j+1} + Y_{2j} Y_{2j+1} + δ Z_{2j} Z_{2j+1})。
+
+    奇键为 qubit 对 (0,1), (2,3), ... (系数 1-s);
+    偶键为 qubit 对 (1,2), (3,4), ... (系数 s)。
+    注意 Qiskit Pauli 字符串为小端序: 最右字符对应 qubit 0。
+    """
+    if qubit_num < 2:
+        raise ValueError("qubit_num must be >= 2 for the XXZ chain.")
+    if qubit_num % 2 != 0:
+        raise ValueError("qubit_num must be even (L/2 bonds required).")
+
+    terms = []
+
+    def _add_bond(a, b, weight):
+        if weight == 0:
+            return
+        for pauli, coeff in (("X", weight), ("Y", weight), ("Z", weight * delta)):
+            if coeff == 0:
+                continue
+            chars = ["I"] * qubit_num
+            chars[qubit_num - 1 - a] = pauli
+            chars[qubit_num - 1 - b] = pauli
+            terms.append(("".join(chars), coeff))
+
+    # H_o: 奇键 (0,1), (2,3), ...
+    for i in range(0, qubit_num - 1, 2):
+        _add_bond(i, i + 1, 1 - s)
+    # H_e: 偶键 (1,2), (3,4), ...
+    for i in range(1, qubit_num - 1, 2):
+        _add_bond(i, i + 1, s)
+
+    if not terms:
+        return SparsePauliOp("I" * qubit_num, coeffs=[0.0])
+    return SparsePauliOp.from_list(terms)
