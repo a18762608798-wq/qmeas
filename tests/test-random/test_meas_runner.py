@@ -82,12 +82,20 @@ if __name__ == "__main__":
 
     result = asyncio.run(run_random(config))
     print(result)
+    assert result["format"] == "hist-v1"
     for npz_name in result["npz_files"]:
         data = np.load(HERE / "data" / npz_name)
+        assert int(data["format_version"]) == 1
+        keys, counts, offsets = (
+            data["measurement_hist_keys"],
+            data["measurement_hist_counts"],
+            data["measurement_hist_offsets"],
+        )
+        assert offsets[0] == 0 and offsets[-1] == len(keys)
         print(
             npz_name,
-            "results:",
-            data["measurement_results"].shape,
+            "hist_keys:",
+            keys.shape,
             "settings:",
             data["measurement_settings"].shape,
         )

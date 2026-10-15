@@ -18,21 +18,29 @@ def save_npz(
     trivial_plain_counts=None,
     tag=None,
 ):
-    """把一个 SettingRun 的原始计数与测量基写成 RandomMeas.jl 兼容的 npz。
+    """把一个 SettingRun 的原始计数与测量基写成 RandomMeasAdd 兼容的 npz。
 
+    计数存直方图（hist-v1，`format_version == 1`），不再存展开矩阵：
+    每个 setting 的去重 bitstring 编成整数 key（bit j = 旧展开矩阵第 j 列，
+    即 meas_indices 展平顺序第 j 个比特），`hist_keys`/`hist_counts` 按
+    `hist_offsets` 切分。settings/binds 与旧格式完全相同。
     trivial_plain_counts 非空时多存一份配对实验一的不带 u_T 的 plain
     标定计数（hamming Z_T 缓解用，见 RandomMeasAdd）：键
-    `trivial_plain_measurement_results`；其 settings/binds 与
-    `trivial_measurement_*` 完全相同（角度绑定复用），故不另存。
+    `trivial_plain_hist_*`；其 settings/binds 与
+    `trivial_hist_*` 完全相同（角度绑定复用），故不另存。
     """
     num_settings = setting_run.num_settings
     num_shots = setting_run.num_shots
     n_meas = sum(len(group) for group in config.meas_indices)
 
+    hist_keys, hist_counts, hist_offsets = counts_to_hist(
+        counts, num_settings, num_shots, n_meas
+    )
     group_data = {
-        "measurement_results": counts_to_results(
-            counts, num_settings, num_shots, n_meas
-        ),
+        "format_version": np.int64(1),
+        "measurement_hist_keys": hist_keys,
+        "measurement_hist_counts": hist_counts,
+        "measurement_hist_offsets": hist_offsets,
         "measurement_settings": build_settings(
             binds, config.params, num_settings, config.meas_indices
         ),
@@ -52,9 +60,12 @@ def save_npz(
     }
 
     if trivial_counts is not None:
-        group_data["trivial_measurement_results"] = counts_to_results(
+        t_keys, t_counts, t_offsets = counts_to_hist(
             trivial_counts, num_settings, trivial_num_shots, n_meas
         )
+        group_data["trivial_hist_keys"] = t_keys
+        group_data["trivial_hist_counts"] = t_counts
+        group_data["trivial_hist_offsets"] = t_offsets
         group_data["trivial_measurement_settings"] = build_settings(
             trivial_binds, config.params, num_settings, config.meas_indices
         )
@@ -67,9 +78,12 @@ def save_npz(
         )
 
     if trivial_plain_counts is not None:
-        group_data["trivial_plain_measurement_results"] = counts_to_results(
+        p_keys, p_counts, p_offsets = counts_to_hist(
             trivial_plain_counts, num_settings, trivial_num_shots, n_meas
         )
+        group_data["trivial_plain_hist_keys"] = p_keys
+        group_data["trivial_plain_hist_counts"] = p_counts
+        group_data["trivial_plain_hist_offsets"] = p_offsets
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     stem = config.name if tag is None else f"{config.name}_{tag}"
@@ -81,24 +95,46 @@ def save_npz(
     return filepath
 
 
-def counts_to_results(counts, num_settings, num_shots, n_meas):
-    """把每 setting 的计数直方图展开成 (num_settings, num_shots, n_meas) 的 0/1 数组。
+def counts_to_hist(counts, num_settings, num_shots, n_meas):
+    """把每 setting 的计数直方图存成扁平 key/count 数组（hist-v1）。
 
-    qiskit (以及 quark 的 compiler=qiskit) 返回的 bitstring 是 little-endian:
-    最左字符对应最高位 clbit。左侧补 0 到 n_meas 后反转, 使第 i 列对应
-    meas_indices 展平顺序中的第 i 个比特。
+    key 编码：整数的 bit j = 旧 `counts_to_results` 展开矩阵第 j 列，
+    即 meas_indices 展平顺序第 j 个比特的值。bitstring 仍按 qiskit
+    little-endian 解读（最左字符为最高位 clbit，左侧补 0 到 n_meas）。
+    `hist_offsets` 长 num_settings+1，第 s 个 setting 切片为
+    `keys[offsets[s]:offsets[s+1]]`；每 setting 内按 key 升序（bitstring
+    字符串序与 key 数值序不一致，故按 key 排，与旧展开的行顺序无关，
+    multiset 一致）。
     """
-    results = np.zeros((num_settings, num_shots, n_meas), dtype=np.uint8)
+    if n_meas > 64:
+        raise ValueError(f"hist key 存成 uint64，n_meas={n_meas} 超限")
+    all_keys: list[int] = []
+    all_counts: list[int] = []
+    offsets = np.zeros(num_settings + 1, dtype=np.int64)
     for s, hist in enumerate(counts):
-        row = 0
-        for bits, count in sorted(hist.items()):
-            vec = np.frombuffer(
-                bits.zfill(n_meas)[::-1].encode("ascii"), dtype=np.uint8
-            ) - ord("0")
-            results[s, row : row + count, :] = vec
-            row += count
-        assert row == num_shots, f"setting {s}: counts 合计 {row} != shots {num_shots}"
-    return results
+        keyed = []
+        for bits, count in hist.items():
+            col = bits.zfill(n_meas)[::-1]
+            key = 0
+            for j, c in enumerate(col):
+                if c == "1":
+                    key |= 1 << j
+            keyed.append((key, count))
+        keyed.sort()
+        total = 0
+        for key, count in keyed:
+            all_keys.append(key)
+            all_counts.append(count)
+            total += count
+        assert total == num_shots, (
+            f"setting {s}: counts 合计 {total} != shots {num_shots}"
+        )
+        offsets[s + 1] = len(all_keys)
+    return (
+        np.asarray(all_keys, dtype=np.uint64),
+        np.asarray(all_counts, dtype=np.int64),
+        offsets,
+    )
 
 
 def build_settings(binds, params, num_settings, meas_indices):
@@ -144,6 +180,7 @@ def write_summary(config, npz_paths, *, pair_info=None):
 
     summary = {
         "runner": "aer" if isinstance(opts, AerOptions) else "quark",
+        "format": "hist-v1",
         "ensemble": config.ensemble,
         "setting_runs": [
             (sr.num_settings, sr.num_shots) for sr in config.setting_runs
