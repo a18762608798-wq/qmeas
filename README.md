@@ -21,10 +21,20 @@
 
 ### random
 
-见 [example/random/](example/random/)：
+通过 `qmeas.random.RandomMeasConfig` + `run_random` 调用（示例目录已移除）：
 
-- Aer（本地仿真）：[aer_example.py](example/random/aer_example.py)
-- Quark（云端）：[quark_example.py](example/random/quark_example.py)
+```python
+import asyncio
+from qmeas.random import AerOptions, RandomMeasConfig, SettingRun, run_random
+
+config = RandomMeasConfig(
+    qc=qc,  # 纯态制备电路，不带经典位
+    setting_runs=[SettingRun(num_settings=10, num_shots=1024)],
+    meas_indices=[(0,), (1,)],  # 同组共享同一随机幺正
+    runner_opts=AerOptions(),  # 云端换 QuarkOptions
+)
+summary = asyncio.run(run_random(config))
+```
 
 ### estimator
 
