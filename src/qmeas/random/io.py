@@ -15,9 +15,16 @@ def save_npz(
     trivial_binds,
     trivial_counts,
     trivial_num_shots,
+    trivial_plain_counts=None,
     tag=None,
 ):
-    """把一个 SettingRun 的原始计数与测量基写成 RandomMeas.jl 兼容的 npz。"""
+    """把一个 SettingRun 的原始计数与测量基写成 RandomMeas.jl 兼容的 npz。
+
+    trivial_plain_counts 非空时多存一份配对实验一的不带 u_T 的 plain
+    标定计数（hamming Z_T 缓解用，见 RandomMeasAdd）：键
+    `trivial_plain_measurement_results`；其 settings/binds 与
+    `trivial_measurement_*` 完全相同（角度绑定复用），故不另存。
+    """
     num_settings = setting_run.num_settings
     num_shots = setting_run.num_shots
     n_meas = sum(len(group) for group in config.meas_indices)
@@ -57,6 +64,11 @@ def save_npz(
         )
         group_data["trivial_phi"] = binds_to_matrix(
             trivial_binds, config.params, "phi"
+        )
+
+    if trivial_plain_counts is not None:
+        group_data["trivial_plain_measurement_results"] = counts_to_results(
+            trivial_plain_counts, num_settings, trivial_num_shots, n_meas
         )
 
     config.output_dir.mkdir(parents=True, exist_ok=True)

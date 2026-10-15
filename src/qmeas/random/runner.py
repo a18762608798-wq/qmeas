@@ -19,6 +19,9 @@ Counts = dict[str, int]
 class RunResult:
     counts: list[Counts]
     trivial_counts: list[Counts] | None = None
+    # 配对实验一的不带 u_T 的 plain 标定计数（hamming Z_T 缓解用）；
+    # 其余情形为 None。settings 与 binds 复用 trivial_*（角度绑定相同）。
+    trivial_plain_counts: list[Counts] | None = None
 
 
 async def run_random(config: RandomMeasConfig) -> dict:
@@ -60,6 +63,15 @@ async def run_random(config: RandomMeasConfig) -> dict:
     trivial_qc_2 = (
         _prepare_trivial_qc(config) if pair is not None else trivial_qc_1
     )
+    # 配对实验一的 plain 标定（不带 u_T，hamming Z_T 缓解用）：
+    # trivial_1 含 u_T（门结构与主电路一致，供 shadow 用），
+    # plain 版供 hamming 标定（要求 |0> 态，见 RandomMeasAdd）。
+    # 非配对时为 None，不跑。
+    trivial_qc_1_plain = (
+        _prepare_trivial_qc(config)
+        if (pair is not None and trivial_qc_1 is not None)
+        else None
+    )
 
     # 真并发: 先把全部 SettingRun（含 exp1/exp2）建成协程, 一次 gather 发出去,
     # 循环体内不 await, 避免串行等待。
@@ -82,6 +94,7 @@ async def run_random(config: RandomMeasConfig) -> dict:
                 setting_run,
                 name=f"{config.name}_setting{run_idx}",
                 trivial_qc=trivial_qc_1,
+                trivial_qc_plain=trivial_qc_1_plain,
                 _submit_sem=submit_sem,
                 _poll_sem=poll_sem,
                 _tmgr=tmgr,
@@ -118,6 +131,7 @@ async def run_random(config: RandomMeasConfig) -> dict:
             trivial_binds=(bind_groups[run_idx] if trivial_qc_1 is not None else None),
             trivial_counts=run_results[run_idx].trivial_counts,
             trivial_num_shots=setting_run.num_shots if trivial_qc_1 is not None else None,
+            trivial_plain_counts=run_results[run_idx].trivial_plain_counts,
             tag="exp1" if pair is not None else None,
         )
         for run_idx, setting_run in enumerate(config.setting_runs)
@@ -153,17 +167,19 @@ async def run_random(config: RandomMeasConfig) -> dict:
 
 
 async def _run_one(
-    opts, qc, binds, setting_run, *, name, trivial_qc,
+    opts, qc, binds, setting_run, *, name, trivial_qc, trivial_qc_plain=None,
     _submit_sem=None, _poll_sem=None, _tmgr=None,
 ):
     # 唯一 await 分发: Aer 是纯阻塞同步计算, 丢进线程池不占事件循环;
     # Quark 自身是真异步协程, 直接 await。
     if isinstance(opts, AerOptions):
         return await asyncio.to_thread(
-            _run_aer, opts, qc, binds, setting_run, name=name, trivial_qc=trivial_qc
+            _run_aer, opts, qc, binds, setting_run, name=name,
+            trivial_qc=trivial_qc, trivial_qc_plain=trivial_qc_plain,
         )
     return await _run_quark(
         opts, qc, binds, setting_run, name=name, trivial_qc=trivial_qc,
+        trivial_qc_plain=trivial_qc_plain,
         _submit_sem=_submit_sem, _poll_sem=_poll_sem, _tmgr=_tmgr,
     )
 
@@ -171,7 +187,7 @@ async def _run_one(
 # ── Aer ────────────────────────────────────────────────────────────
 
 
-def _run_aer(opts, qc, binds, setting_run, *, name, trivial_qc):
+def _run_aer(opts, qc, binds, setting_run, *, name, trivial_qc, trivial_qc_plain=None):
     simulator = AerSimulator(
         method=opts.method,
         device=opts.device,
@@ -194,14 +210,29 @@ def _run_aer(opts, qc, binds, setting_run, *, name, trivial_qc):
     trivial_counts = [
         trivial_job.result().get_counts(i) for i in range(setting_run.num_settings)
     ]
-    return RunResult(counts=counts, trivial_counts=trivial_counts)
+    if trivial_qc_plain is None:
+        return RunResult(counts=counts, trivial_counts=trivial_counts)
+
+    plain_job = simulator.run(
+        transpile(trivial_qc_plain, simulator),
+        shots=setting_run.num_shots,
+        parameter_binds=[binds],
+    )
+    trivial_plain_counts = [
+        plain_job.result().get_counts(i) for i in range(setting_run.num_settings)
+    ]
+    return RunResult(
+        counts=counts,
+        trivial_counts=trivial_counts,
+        trivial_plain_counts=trivial_plain_counts,
+    )
 
 
 # ── Quark 编排（HTTP 细节见 quark_client） ─────────────────────────
 
 
 async def _run_quark(
-    opts, qc, binds, setting_run, *, name, trivial_qc,
+    opts, qc, binds, setting_run, *, name, trivial_qc, trivial_qc_plain=None,
     _submit_sem=None, _poll_sem=None, _tmgr=None,
 ):
     # transpile 是 CPU 阻塞工作, 丢进线程池; 主/标定两个批量一次 gather。
@@ -212,11 +243,19 @@ async def _run_quark(
                 _to_qasm2, trivial_qc, setting_run.num_settings, binds, opts
             ),
         )
+        plain_qasm_ls = (
+            await asyncio.to_thread(
+                _to_qasm2, trivial_qc_plain, setting_run.num_settings, binds, opts
+            )
+            if trivial_qc_plain is not None
+            else None
+        )
     else:
         qasm_ls = await asyncio.to_thread(
             _to_qasm2, qc, setting_run.num_settings, binds, opts
         )
         trivial_qasm_ls = None
+        plain_qasm_ls = None
 
     # 未经 run_random 分发的直接调用：本地建默认限流与共享 Task，保证行为一致。
     if _submit_sem is None:
@@ -246,6 +285,15 @@ async def _run_quark(
                 )
             )
             specs.append((trivial_qasm_ls[i], setting_run.num_shots, f"{name}_calib_U{i}"))
+            if plain_qasm_ls is not None:
+                submit_coros.append(
+                    _submit_one(
+                        plain_qasm_ls[i], setting_run.num_shots, f"{name}_plain_U{i}"
+                    )
+                )
+                specs.append(
+                    (plain_qasm_ls[i], setting_run.num_shots, f"{name}_plain_U{i}")
+                )
     tids = list(await asyncio.gather(*submit_coros))
 
     # 轮询已是并发: 建 task 不 await, 一次 gather 等全部。
@@ -267,7 +315,13 @@ async def _run_quark(
 
     if trivial_qasm_ls is None:
         return RunResult(counts=counts)
-    return RunResult(counts=counts[0::2], trivial_counts=counts[1::2])
+    if plain_qasm_ls is None:
+        return RunResult(counts=counts[0::2], trivial_counts=counts[1::2])
+    return RunResult(
+        counts=counts[0::3],
+        trivial_counts=counts[1::3],
+        trivial_plain_counts=counts[2::3],
+    )
 
 
 # ── Circuit & params ───────────────────────────────────────────────

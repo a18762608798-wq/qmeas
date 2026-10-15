@@ -13,6 +13,7 @@ dependencies = [
     "qiskit>=1.0",
     "qiskit-aer",
     "quarkstudio",
+    "matplotlib",
 ]
 
 [tool.hatch.build.targets.wheel]
