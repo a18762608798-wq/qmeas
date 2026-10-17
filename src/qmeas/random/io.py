@@ -174,7 +174,7 @@ def binds_to_matrix(binds, params, name):
     return np.asarray([binds[p] for p in pvec], dtype=np.float64).T
 
 
-def write_summary(config, npz_paths, *, pair_info=None):
+def write_summary(config, npz_paths, *, pair_info=None, manifest_file=None):
     """轻量 json: 只含字符串与结构信息, 计数与角度已进 npz。"""
     opts = config.runner_opts
 
@@ -192,6 +192,8 @@ def write_summary(config, npz_paths, *, pair_info=None):
     }
     if pair_info is not None:
         summary["conjugate_pair"] = pair_info
+    if manifest_file is not None:
+        summary["quark_manifest"] = manifest_file
     if isinstance(opts, QuarkOptions):
         summary["chip"] = opts.chip
         summary["target_qubits"] = opts.target_qubits

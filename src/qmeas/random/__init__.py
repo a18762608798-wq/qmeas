@@ -7,6 +7,7 @@ from .config import (
     SettingRun,
 )
 from .ensemble import ParameterGenerator, conjugate_binds, create_parameter_generator
+from .manifest import manifest_path, pending_tids
 from .runner import add_meas, run_random
 
 __all__ = [
@@ -21,4 +22,6 @@ __all__ = [
     "create_parameter_generator",
     "add_meas",
     "run_random",
+    "manifest_path",
+    "pending_tids",
 ]

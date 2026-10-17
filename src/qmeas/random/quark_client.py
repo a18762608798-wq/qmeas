@@ -129,7 +129,7 @@ def fetch_quark_result(tmgr, tid):
     return tmgr.result(tid)
 
 
-async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attempt_tag=""):
+async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attempt_tag="", on_resubmit=None):
     """轮询单个电路结果，返回计数字典（C 策略）。
 
     - 有 "count"：成功返回。
@@ -140,6 +140,8 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
       耗尽后抛 RuntimeError 中断整组（C 策略 fail-fast 部分）。
       含 DETERMINISTIC_ERROR_KEYWORDS（如 mismatch）的确定性错误不重提，
       直接抛错（重提必败，省配额）。
+    - on_resubmit 非空时，每次重提成功后调用 ``await on_resubmit(new_tid)``，
+      供调用方把新 tid 记入 manifest（断点续跑用）。
     """
     start = time.monotonic()
     tried_tids = [tid]
@@ -202,6 +204,8 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
                     submit_quark, tmgr, opts, qasm_str, shots, name
                 )
             tried_tids.append(tid)
+            if on_resubmit is not None:
+                await on_resubmit(tid)
             continue
 
 
