@@ -9,6 +9,8 @@
   不建新任务；平台 error（如过载误报的 Transpiler 错误）→ 旧 tid 尽力
   cancel/delete 后，用原 QASM 重提新 tid（max_resubmits 次，默认 1），
   耗尽后抛错中断（C 策略）。
+- 空字典黑洞：空 {} / 非 dict、或终态（Finished/Failed/Cancelled）却无
+  count 无 error，都直接视同平台 error，统一走原 QASM 重提（max_resubmits 次）。
 """
 
 import asyncio
@@ -133,6 +135,10 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
     """轮询单个电路结果，返回计数字典（C 策略）。
 
     - 有 "count"：成功返回。
+    - 空 dict {} / 非 dict：视同 error，立即重提新 tid。
+    - 非空 dict 为终态（status ∈ Finished/Failed/Cancelled/Canceled）却无
+      "count"：视同 error 重提新 tid；未完成中间态（Running/Pending/Compiling
+      或无 status）正常继续等。
     - 传输层失败（非 JSON/连接错）：指数退避重试本 tid 查询（poll_retries），
       不建新任务；仍受 poll_timeout 约束。
     - 平台 "error" 非空（含过载误报的 Transpiler 错误）：旧 tid 尽力
@@ -146,6 +152,40 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
     start = time.monotonic()
     tried_tids = [tid]
     resubmits = 0
+
+    async def _resubmit(err):
+        """异常返回/error 统一重提：确定性检查 → 配额检查 → 放弃旧 tid → 提新 tid。"""
+        nonlocal tid, resubmits
+        if any(k in str(err).lower() for k in DETERMINISTIC_ERROR_KEYWORDS):
+            raise RuntimeError(
+                f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
+                f"此类错误是确定性的（如电路比特数与 target_qubits 不匹配），"
+                f"重提必败，故不重提直接中断；请检查电路/映射后补跑该组。"
+            )
+        if resubmits >= opts.max_resubmits:
+            raise RuntimeError(
+                f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
+                f"已用原 QASM 重提 {resubmits} 次仍失败；小并发可过而大批量失败多为"
+                f"平台过载误报，建议降 max_submit_concurrency 后补跑该组。"
+            )
+        resubmits += 1
+        print(
+            f"quark 任务 {tid}（{name}）异常，重提新 tid"
+            f"（第 {resubmits}/{opts.max_resubmits} 次）: {err!r}"
+        )
+        try:
+            await asyncio.to_thread(abandon_quark_task, tmgr, tid)
+        except Exception:
+            pass
+        await asyncio.sleep(backoff(resubmits, base=15.0, cap=180.0))
+        async with submit_sem:
+            tid = await asyncio.to_thread(
+                submit_quark, tmgr, opts, qasm_str, shots, name
+            )
+        tried_tids.append(tid)
+        if on_resubmit is not None:
+            await on_resubmit(tid)
+
     # 首轮抖动，打散全 run 整齐轮询的惊群
     await asyncio.sleep(random.uniform(0, min(opts.poll_interval, 5.0)))
     while True:
@@ -172,41 +212,18 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
                 print(f"quark 任务 {tid}（{name}）查询抖动，继续等待：{e!r}")
                 continue
         if not isinstance(res, dict) or not res:
+            await _resubmit("empty result dict")
             continue
         if "count" in res:
             return res["count"]
         err = res.get("error")
         if err:
-            if any(k in str(err).lower() for k in DETERMINISTIC_ERROR_KEYWORDS):
-                raise RuntimeError(
-                    f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
-                    f"此类错误是确定性的（如电路比特数与 target_qubits 不匹配），"
-                    f"重提必败，故不重提直接中断；请检查电路/映射后补跑该组。"
-                )
-            if resubmits >= opts.max_resubmits:
-                raise RuntimeError(
-                    f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
-                    f"已用原 QASM 重提 {resubmits} 次仍失败；小并发可过而大批量失败多为"
-                    f"平台过载误报，建议降 max_submit_concurrency 后补跑该组。"
-                )
-            resubmits += 1
-            print(
-                f"quark 任务 {tid}（{name}）平台 error，重提新 tid"
-                f"（第 {resubmits}/{opts.max_resubmits} 次）: {err!r}"
-            )
-            try:
-                await asyncio.to_thread(abandon_quark_task, tmgr, tid)
-            except Exception:
-                pass
-            await asyncio.sleep(backoff(resubmits, base=15.0, cap=180.0))
-            async with submit_sem:
-                tid = await asyncio.to_thread(
-                    submit_quark, tmgr, opts, qasm_str, shots, name
-                )
-            tried_tids.append(tid)
-            if on_resubmit is not None:
-                await on_resubmit(tid)
+            await _resubmit(err)
             continue
+        if res.get("status") in ("Finished", "Failed", "Cancelled", "Canceled"):
+            await _resubmit(f"terminal status {res.get('status')!r} without count")
+            continue
+        # 未完成中间态（Running/Pending/Compiling 或无 status）：继续等
 
 
 def abandon_quark_task(tmgr, tid):

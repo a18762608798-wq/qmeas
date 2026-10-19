@@ -196,6 +196,12 @@ async def run_benchmark(config: BenchmarkConfig, chains=None) -> list[ChainResul
     # 阶段二：统一轮询，完成一份落盘一份（as_completed 逐个回填）。
     async def _poll_one(job, key):
         async with poll_sem:
+            async def _on_resubmit(new_tid):
+                # 重提换 tid 后同步更新 checkpoint，防止落盘废弃的旧 tid
+                job["tids"][key] = new_tid
+                _save_ckpt(config, job["chip"], job["ci"], job["chain"],
+                           job["counts"], job["tids"])
+
             hist = await await_quark(
                 tmgr,
                 job["tids"][key],
@@ -205,6 +211,7 @@ async def run_benchmark(config: BenchmarkConfig, chains=None) -> list[ChainResul
                 config.shots,
                 f"{config.name}_{job['chip']}_c{job['ci']}_{key}",
                 attempt_tag=f"{job['chip']}_c{job['ci']}",
+                on_resubmit=_on_resubmit,
             )
             return id(job), key, hist
 

@@ -239,3 +239,125 @@ def test_ring_circuits_noiseless():
         counts = sim.run(cs.circuits[key], shots=1024).result().get_counts()
         evs = rec.recover(cs.stab_groups[key], counts, 1024)
         assert abs(sum(evs.values()) / len(evs) - 1.0) < 1e-9
+
+
+# ── await_quark 空字典黑洞 / 终态无 count ─────────────────────────
+
+
+def _poll_opts(**kw):
+    """极小 poll_interval（毫秒级）+ poll_timeout 安全网，测试不卡死。"""
+    from qmeas.random.config import QuarkOptions
+
+    base = dict(poll_interval=0.001, poll_timeout=10.0,
+                submit_retries=0, poll_retries=0)
+    base.update(kw)
+    return QuarkOptions(**base)
+
+
+def test_await_quark_empty_dict_resubmit(monkeypatch):
+    """空 {} 视同 error 立即重提新 tid 并成功取回计数。"""
+    from qmeas.random import quark_client
+
+    monkeypatch.setattr(quark_client, "backoff", lambda *a, **k: 0.0)
+
+    class Mock:
+        def __init__(self):
+            self.tid = 1  # 初始 tid=1 由调用方直接传入，占住 1 号
+            self.runs = 0
+            self.polls = {}
+
+        def run(self, task):
+            self.runs += 1
+            self.tid += 1
+            return self.tid
+
+        def result(self, tid):
+            self.polls[tid] = self.polls.get(tid, 0) + 1
+            return {"count": {"00": 1024}} if tid >= 2 else {}
+
+    mock = Mock()
+    opts = _poll_opts(max_resubmits=1)
+    new_tids = []
+
+    async def on_resubmit(new_tid):
+        new_tids.append(new_tid)
+
+    counts = asyncio.run(quark_client.await_quark(
+        mock, 1, opts, asyncio.Semaphore(1), "qasm", 1024, "job",
+        on_resubmit=on_resubmit,
+    ))
+    assert counts == {"00": 1024}
+    assert mock.runs == 1      # 恰好 1 次重提（初始 tid 直接传入，不走 run）
+    assert new_tids == [2]     # on_resubmit 收到新 tid（tried_tids 推进）
+    assert mock.polls[1] == 1  # 第 1 次空 {} 即触发重提，不空转
+
+
+def test_await_quark_empty_exhausts_resubmits(monkeypatch):
+    """所有 tid 一直返回 {}：重提满 max_resubmits 次后抛 RuntimeError，不无限卡死。"""
+    from qmeas.random import quark_client
+
+    monkeypatch.setattr(quark_client, "backoff", lambda *a, **k: 0.0)
+
+    class Mock:
+        def __init__(self):
+            self.tid = 1  # 初始 tid=1 由调用方直接传入，占住 1 号
+            self.runs = 0
+
+        def run(self, task):
+            self.runs += 1
+            self.tid += 1
+            return self.tid
+
+        def result(self, tid):
+            return {}
+
+    mock = Mock()
+    opts = _poll_opts(max_resubmits=2)
+    with pytest.raises(RuntimeError):
+        asyncio.run(quark_client.await_quark(
+            mock, 1, opts, asyncio.Semaphore(1), "qasm", 1024, "job",
+        ))
+    # 重提 2 次后，第 3 次空 {} 耗尽 max_resubmits 抛错
+    assert mock.runs == 2
+
+
+def test_await_quark_running_vs_terminal_no_count(monkeypatch):
+    """未完成中间态（Running）不误触发重提；终态无 count（Finished）立即重提。"""
+    from qmeas.random import quark_client
+
+    monkeypatch.setattr(quark_client, "backoff", lambda *a, **k: 0.0)
+
+    class Mock:
+        def __init__(self):
+            self.tid = 1  # 初始 tid=1 由调用方直接传入，占住 1 号
+            self.runs = 0
+            self.polls = {}
+
+        def run(self, task):
+            self.runs += 1
+            self.tid += 1
+            return self.tid
+
+        def result(self, tid):
+            self.polls[tid] = self.polls.get(tid, 0) + 1
+            if tid >= 2:
+                return {"count": {"00": 1024}}
+            # 前 3 次未完成中间态；第 4 次终态却无 count 无 error
+            return ({"status": "Running", "error": ""}
+                    if self.polls[tid] <= 3 else {"status": "Finished"})
+
+    mock = Mock()
+    opts = _poll_opts(max_resubmits=1)
+    new_tids = []
+
+    async def on_resubmit(new_tid):
+        new_tids.append(new_tid)
+
+    counts = asyncio.run(quark_client.await_quark(
+        mock, 1, opts, asyncio.Semaphore(1), "qasm", 1024, "job",
+        on_resubmit=on_resubmit,
+    ))
+    assert counts == {"00": 1024}
+    assert mock.runs == 1      # Running 未触发重提，仅 Finished 无 count 触发 1 次
+    assert new_tids == [2]
+    assert mock.polls[1] == 4  # 3 次 Running + 1 次 Finished，无多余空转
