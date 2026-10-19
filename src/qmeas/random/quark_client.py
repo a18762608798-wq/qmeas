@@ -9,8 +9,10 @@
   不建新任务；平台 error（如过载误报的 Transpiler 错误）→ 旧 tid 尽力
   cancel/delete 后，用原 QASM 重提新 tid（max_resubmits 次，默认 1），
   耗尽后抛错中断（C 策略）。
-- 空字典黑洞：空 {} / 非 dict、或终态（Finished/Failed/Cancelled）却无
-  count 无 error，都直接视同平台 error，统一走原 QASM 重提（max_resubmits 次）。
+- 空字典黑洞：空 {} / 非 dict 时每 _EMPTY_STATUS_CHECK_EVERY 轮调
+  status(tid) 区分排队中与终态，仅终态（Finished/Failed/Cancelled/Canceled）
+  却无 count 才按异常走原 QASM 重提（max_resubmits 次）；
+  Submitted/Running 等非终态继续等待，绝不误杀。
 """
 
 import asyncio
@@ -26,12 +28,14 @@ __all__ = [
     "TRANSIENT_HTTP_ERRORS",
     "RETRYABLE_SUBMIT_KEYWORDS",
     "DETERMINISTIC_ERROR_KEYWORDS",
+    "TERMINAL_TASK_STATUSES",
     "quark_token",
     "make_quark_task",
     "backoff",
     "looks_retryable_submit",
     "submit_quark",
     "fetch_quark_result",
+    "fetch_quark_status",
     "await_quark",
     "abandon_quark_task",
 ]
@@ -51,6 +55,11 @@ RETRYABLE_SUBMIT_KEYWORDS = (
 # 平台 error 含这些关键字时视为确定性错误（如比特映射错配），重提必败，
 # 直接抛错，不消耗 max_resubmits（省配额）。
 DETERMINISTIC_ERROR_KEYWORDS = ("mismatch",)
+
+# 任务终态：这些状态表示任务已结束（无论成败），据此判定"终态空包黑洞"。
+TERMINAL_TASK_STATUSES = ("Finished", "Failed", "Cancelled", "Canceled")
+# 连续多少次空 {} 才调一次 tmgr.status(tid) 探终态（控请求量；排队数小时不误杀）
+_EMPTY_STATUS_CHECK_EVERY = 3
 
 
 def quark_token(opts) -> str:
@@ -131,13 +140,35 @@ def fetch_quark_result(tmgr, tid):
     return tmgr.result(tid)
 
 
+def _extract_status(st, tid=None):
+    """从 tmgr.status(tid) 的各种返回形态提取状态字符串；提取不到返回 None。"""
+    if isinstance(st, str):
+        return st.strip()
+    if isinstance(st, dict):
+        if isinstance(st.get("status"), str):
+            return st["status"].strip()
+        if tid is not None:
+            for key in (tid, str(tid)):
+                if key in st:
+                    return _extract_status(st[key], tid)
+    return None
+
+
+def fetch_quark_status(tmgr, tid):
+    """同步阻塞查单任务状态（调用方负责 to_thread）；只取一次，异常由外层负责。"""
+    return tmgr.status(tid)
+
+
 async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attempt_tag="", on_resubmit=None):
     """轮询单个电路结果，返回计数字典（C 策略）。
 
     - 有 "count"：成功返回。
-    - 空 dict {} / 非 dict：视同 error，立即重提新 tid。
-    - 非空 dict 为终态（status ∈ Finished/Failed/Cancelled/Canceled）却无
-      "count"：视同 error 重提新 tid；未完成中间态（Running/Pending/Compiling
+    - 空 dict {} / 非 dict：每 _EMPTY_STATUS_CHECK_EVERY 轮调 tmgr.status(tid)
+      区分排队中与终态；仅终态（Finished/Failed/Cancelled/Canceled）却无
+      "count" 才视同 error 重提新 tid，Submitted/Running/Pending 等非终态或
+      状态查询失败/未知一律继续等待（排队数小时不误杀）。
+    - 非空 dict 为终态（status ∈ TERMINAL_TASK_STATUSES）却无 "count"：
+      视同 error 重提新 tid；未完成中间态（Running/Pending/Compiling
       或无 status）正常继续等。
     - 传输层失败（非 JSON/连接错）：指数退避重试本 tid 查询（poll_retries），
       不建新任务；仍受 poll_timeout 约束。
@@ -152,10 +183,11 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
     start = time.monotonic()
     tried_tids = [tid]
     resubmits = 0
+    empty_rounds = 0
 
     async def _resubmit(err):
         """异常返回/error 统一重提：确定性检查 → 配额检查 → 放弃旧 tid → 提新 tid。"""
-        nonlocal tid, resubmits
+        nonlocal tid, resubmits, empty_rounds
         if any(k in str(err).lower() for k in DETERMINISTIC_ERROR_KEYWORDS):
             raise RuntimeError(
                 f"quark 任务失败 {name}（tag={attempt_tag}，tids={tried_tids}）: {err!r}。"
@@ -169,6 +201,7 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
                 f"平台过载误报，建议降 max_submit_concurrency 后补跑该组。"
             )
         resubmits += 1
+        empty_rounds = 0
         print(
             f"quark 任务 {tid}（{name}）异常，重提新 tid"
             f"（第 {resubmits}/{opts.max_resubmits} 次）: {err!r}"
@@ -212,18 +245,29 @@ async def await_quark(tmgr, tid, opts, submit_sem, qasm_str, shots, name, attemp
                 print(f"quark 任务 {tid}（{name}）查询抖动，继续等待：{e!r}")
                 continue
         if not isinstance(res, dict) or not res:
-            await _resubmit("empty result dict")
+            empty_rounds += 1
+            if empty_rounds % _EMPTY_STATUS_CHECK_EVERY != 0:
+                continue
+            # 每 N 轮空包探一次状态：只有确认终态才重提，排队中绝不误杀
+            try:
+                raw_st = await asyncio.to_thread(fetch_quark_status, tmgr, tid)
+            except Exception:
+                continue
+            st = _extract_status(raw_st, tid)
+            if st in TERMINAL_TASK_STATUSES:
+                await _resubmit(f"empty result dict while status={st!r}")
             continue
+        empty_rounds = 0
         if "count" in res:
             return res["count"]
         err = res.get("error")
         if err:
             await _resubmit(err)
             continue
-        if res.get("status") in ("Finished", "Failed", "Cancelled", "Canceled"):
+        if res.get("status") in TERMINAL_TASK_STATUSES:
             await _resubmit(f"terminal status {res.get('status')!r} without count")
             continue
-        # 未完成中间态（Running/Pending/Compiling 或无 status）：继续等
+        # 未完成中间态（Submitted/Running/Pending/Compiling 或无 status）：继续等
 
 
 def abandon_quark_task(tmgr, tid):

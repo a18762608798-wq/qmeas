@@ -67,9 +67,10 @@ class QuarkOptions:
     # 提交/轮询遇到传输层失败（非 JSON、空响应、连接错）的重试次数（指数退避）。
     submit_retries: int = 6
     poll_retries: int = 8
-    # 轮询到平台 error（如过载误报的 Transpiler 错误）或异常返回（空 {}、
-    # 终态无 count 等）时，用原 QASM 重提新 tid 的次数（旧 tid 尽力
-    # cancel/delete）；耗尽后抛错中断（C 策略：fail-fast + 重提）。
+    # 轮询到平台 error（如过载误报的 Transpiler 错误）或异常返回（空 {} 经
+    # status(tid) 确认终态却无 count 等）时，用原 QASM 重提新 tid 的次数
+    # （旧 tid 尽力 cancel/delete）；耗尽后抛错中断（C 策略：fail-fast + 重提）。
+    # 排队中（Submitted/Running 等非终态）的空 {} 不算异常、绝不重提。
     max_resubmits: int = 3
 
 
